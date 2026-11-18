@@ -16,6 +16,7 @@ Examples:
 """
 import time
 
+import os
 from pathlib import Path
 
 import pandas as pd
@@ -36,6 +37,40 @@ LABELS = {
     "STL_BLK": "stocks_pg",  # steals + blocks
 }
 
+# Workaround for NBA.com blocking hosting providers:
+#  - browser-like headers on every request
+#  - optional PROXY_URL env var (e.g. http://user:pass@host:port) to route
+#    requests through a proxy with a non-datacenter IP
+#  - retries, and stale cached data if NBA.com is unreachable
+PROXY = os.environ.get("PROXY_URL") or None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Referer": "https://www.nba.com/",
+    "Origin": "https://www.nba.com",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def nba_fetch(endpoint, retries: int = 3, **params):
+    """Call an nba_api endpoint with headers/proxy and simple retry."""
+    last = None
+    for attempt in range(retries):
+        try:
+            return endpoint(
+                headers=HEADERS, proxy=PROXY, timeout=20, **params
+            ).get_data_frames()[0]
+        except Exception as e:  # network errors, timeouts, blocks
+            last = e
+            time.sleep(1.5 * (attempt + 1))
+    raise HTTPException(
+        503,
+        "Couldn't reach NBA.com (it may be blocking this server). "
+        f"Set PROXY_URL or run from a home network. Detail: {type(last).__name__}",
+    )
+
+
 app = FastAPI(title="NBA Player Stats")
 _cache: dict[int, tuple[float, pd.DataFrame]] = {}
 
@@ -54,9 +89,14 @@ def load_games(player_id: int) -> pd.DataFrame:
     if hit and time.time() - hit[0] < CACHE_SECONDS:
         return hit[1]
 
-    df = playergamelog.PlayerGameLog(
-        player_id=player_id, season=SEASON, timeout=30
-    ).get_data_frames()[0]
+    try:
+        df = nba_fetch(
+            playergamelog.PlayerGameLog, player_id=player_id, season=SEASON
+        )
+    except HTTPException:
+        if hit:  # serve stale data rather than failing
+            return hit[1]
+        raise
     if df.empty:
         raise HTTPException(404, f"No games found for {SEASON}")
 
@@ -148,9 +188,16 @@ def leaderboard(stat: str = "PTS", limit: int = 25, min_games: int = 5):
     if stat not in STATS:
         raise HTTPException(400, f"stat must be one of {STATS}")
     if time.time() - _lb_cache["t"] > CACHE_SECONDS or _lb_cache["df"] is None:
-        df = leaguedashplayerstats.LeagueDashPlayerStats(
-            season=SEASON, per_mode_detailed="PerGame", timeout=30
-        ).get_data_frames()[0]
+        try:
+            df = nba_fetch(
+                leaguedashplayerstats.LeagueDashPlayerStats,
+                season=SEASON,
+                per_mode_detailed="PerGame",
+            )
+        except HTTPException:
+            if _lb_cache["df"] is None:
+                raise
+            df = _lb_cache["df"]
         df["STL_BLK"] = df["STL"] + df["BLK"]
         _lb_cache.update(t=time.time(), df=df)
     df = _lb_cache["df"]
