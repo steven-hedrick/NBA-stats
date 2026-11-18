@@ -1,7 +1,7 @@
 """
 NBA player stats API.
 
-Setup:   pip install fastapi uvicorn nba_api pandas
+Setup:   pip install fastapi uvicorn nba_api pandas requests
 Run:     uvicorn nba_app:app --reload
 Docs:    http://127.0.0.1:8000/docs
 
@@ -20,6 +20,7 @@ import os
 from pathlib import Path
 
 import pandas as pd
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from nba_api.stats.endpoints import leaguedashplayerstats, playergamelog
@@ -53,13 +54,13 @@ HEADERS = {
 }
 
 
-def nba_fetch(endpoint, retries: int = 3, **params):
+def nba_fetch(endpoint, retries: int = 1, **params):
     """Call an nba_api endpoint with headers/proxy and simple retry."""
     last = None
     for attempt in range(retries):
         try:
             return endpoint(
-                headers=HEADERS, proxy=PROXY, timeout=20, **params
+                headers=HEADERS, proxy=PROXY, timeout=10, **params
             ).get_data_frames()[0]
         except Exception as e:  # network errors, timeouts, blocks
             last = e
@@ -84,7 +85,82 @@ def find_player(name: str) -> dict:
     return pool[0]
 
 
-def load_games(player_id: int) -> pd.DataFrame:
+ESPN_SEARCH = "https://site.web.api.espn.com/apis/common/v3/search"
+ESPN_GAMELOG = (
+    "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/"
+    "athletes/{id}/gamelog"
+)
+
+
+def espn_get(url: str, **params) -> dict:
+    r = requests.get(
+        url,
+        params=params,
+        headers=HEADERS,
+        timeout=20,
+        proxies={"http": PROXY, "https": PROXY} if PROXY else None,
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def espn_athlete_id(name: str) -> str:
+    items = espn_get(ESPN_SEARCH, query=name, limit=10, mode="prefix").get("items", [])
+    found = [i for i in items if i.get("type") == "player"]
+    nba = [i for i in found if "~l:46~" in i.get("uid", "")]  # l:46 = NBA
+    pick = (nba or found or [None])[0]
+    if not pick:
+        raise HTTPException(404, f"ESPN has no player named '{name}'")
+    return str(pick["id"])
+
+
+def espn_games(name: str) -> pd.DataFrame:
+    """Free fallback: ESPN's unofficial game log for the current season."""
+    data = espn_get(ESPN_GAMELOG.format(id=espn_athlete_id(name)))
+    labels = data.get("labels") or data.get("names") or []
+    idx = {label: i for i, label in enumerate(labels)}
+    events = data.get("events", {})
+    rows = []
+    for st in data.get("seasonTypes", []):
+        if "regular" not in st.get("displayName", "").lower():
+            continue
+        for cat in st.get("categories", []):
+            for ev in cat.get("events", []):
+                meta = events.get(str(ev.get("eventId")))
+                stats = ev.get("stats", [])
+                if not meta or len(stats) < len(labels):
+                    continue
+                try:
+                    rows.append(
+                        {
+                            "GAME_DATE": meta["gameDate"],
+                            "OPP": meta["opponent"]["abbreviation"],
+                            "HOME": meta.get("atVs") == "vs",
+                            "PTS": float(stats[idx["PTS"]]),
+                            "REB": float(stats[idx["REB"]]),
+                            "AST": float(stats[idx["AST"]]),
+                            "FG3M": float(str(stats[idx["3PT"]]).split("-")[0]),
+                            "STL": float(stats[idx["STL"]]),
+                            "BLK": float(stats[idx["BLK"]]),
+                        }
+                    )
+                except (KeyError, ValueError, TypeError):
+                    continue  # skip rows we can't parse (e.g. DNP)
+    if not rows:
+        raise HTTPException(404, "ESPN returned no parsable games for this season")
+    df = pd.DataFrame(rows)
+    # ESPN dates are UTC; convert to US Eastern so late games land on the right day
+    df["GAME_DATE"] = (
+        pd.to_datetime(df["GAME_DATE"], utc=True)
+        .dt.tz_convert("America/New_York")
+        .dt.tz_localize(None)
+        .dt.normalize()
+    )
+    return df
+
+
+def load_games(p: dict) -> pd.DataFrame:
+    player_id = p["id"]
     hit = _cache.get(player_id)
     if hit and time.time() - hit[0] < CACHE_SECONDS:
         return hit[1]
@@ -93,23 +169,44 @@ def load_games(player_id: int) -> pd.DataFrame:
         df = nba_fetch(
             playergamelog.PlayerGameLog, player_id=player_id, season=SEASON
         )
-    except HTTPException:
-        if hit:  # serve stale data rather than failing
-            return hit[1]
-        raise
-    if df.empty:
-        raise HTTPException(404, f"No games found for {SEASON}")
+        if df.empty:
+            raise HTTPException(404, f"No games found for {SEASON}")
+        df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+        df["OPP"] = df["MATCHUP"].str.split().str[-1]  # "LAL vs. BOS" -> "BOS"
+        df["HOME"] = df["MATCHUP"].str.contains("vs.", regex=False)
+    except HTTPException as nba_err:
+        if nba_err.status_code == 404:
+            raise
+        try:  # NBA.com blocked us -> try ESPN
+            df = espn_games(p["full_name"])
+        except HTTPException:
+            raise
+        except Exception as e:
+            if hit:  # serve stale data rather than failing
+                return hit[1]
+            raise HTTPException(
+                503, f"NBA.com and ESPN both failed ({type(e).__name__})"
+            )
 
-    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
     df = df.sort_values("GAME_DATE").reset_index(drop=True)
-    df["OPP"] = df["MATCHUP"].str.split().str[-1]  # "LAL vs. BOS" -> "BOS"
     df["STL_BLK"] = df["STL"] + df["BLK"]
     # Second night of a back-to-back = played the calendar day before
     df["B2B"] = df["GAME_DATE"].diff().dt.days.eq(1)
-    df["HOME"] = df["MATCHUP"].str.contains("vs.", regex=False)
 
     _cache[player_id] = (time.time(), df)
     return df
+
+
+@app.get("/debug/espn/{name}")
+def debug_espn(name: str):
+    """Troubleshooting: shows the raw shape of ESPN's response."""
+    data = espn_get(ESPN_GAMELOG.format(id=espn_athlete_id(name)))
+    return {
+        "top_level_keys": list(data.keys()),
+        "labels": data.get("labels"),
+        "season_types": [st.get("displayName") for st in data.get("seasonTypes", [])],
+        "sample_event": next(iter(data.get("events", {}).values()), None),
+    }
 
 
 def averages(df: pd.DataFrame) -> dict:
@@ -122,14 +219,14 @@ def averages(df: pd.DataFrame) -> dict:
 @app.get("/player/{name}/season")
 def season(name: str):
     p = find_player(name)
-    df = load_games(p["id"])
+    df = load_games(p)
     return {"player": p["full_name"], "season": SEASON, **averages(df)}
 
 
 @app.get("/player/{name}/vs-opponents")
 def vs_opponents(name: str):
     p = find_player(name)
-    df = load_games(p["id"])
+    df = load_games(p)
     rows = [{"opponent": opp, **averages(g)} for opp, g in df.groupby("OPP")]
     rows.sort(key=lambda r: r["ppg"], reverse=True)
     return {
@@ -143,7 +240,7 @@ def vs_opponents(name: str):
 @app.get("/player/{name}/back-to-back")
 def back_to_back(name: str):
     p = find_player(name)
-    df = load_games(p["id"])
+    df = load_games(p)
     b2b, rested = averages(df[df["B2B"]]), averages(df[~df["B2B"]])
     diff = {
         label: round(b2b[label] - rested[label], 1)
@@ -163,7 +260,7 @@ def back_to_back(name: str):
 @app.get("/player/{name}/home-away")
 def home_away(name: str):
     p = find_player(name)
-    df = load_games(p["id"])
+    df = load_games(p)
     home, away = averages(df[df["HOME"]]), averages(df[~df["HOME"]])
     diff = {
         label: round(home[label] - away[label], 1)
