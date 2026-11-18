@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#c8501e">
+<title>NBA Player Stats</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--mut:#6b6b6b;--card:#f3f3f1;--acc:#c8501e;--line:#ddd}
+@media (prefers-color-scheme:dark){:root{--bg:#161616;--fg:#eee;--mut:#9a9a9a;--card:#222;--acc:#ff8a57;--line:#333}}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:var(--bg);color:var(--fg);font:15px/1.4 system-ui,sans-serif;max-width:720px;margin-inline:auto}
+h1{font-size:20px;margin:0 0 12px}
+input,button{font:inherit;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--fg)}
+input{width:100%}
+.tabs{display:flex;gap:6px;overflow-x:auto;margin:12px 0}
+.tabs button{white-space:nowrap}
+.tabs button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+.wrap{overflow-x:auto}
+table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+th,td{padding:8px 6px;text-align:right;border-bottom:1px solid var(--line);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:600;font-size:13px}
+.pos{color:#2e9d5b}.neg{color:#d64545}
+.mut{color:var(--mut)}
+h2{font-size:16px;margin:16px 0 6px}
+</style>
+</head>
+<body>
+<h1>NBA Player Stats</h1>
+<input id="q" list="sugg" placeholder="Search a player, e.g. Jalen Brunson" autocomplete="off">
+<datalist id="sugg"></datalist>
+<div class="tabs" id="tabs"></div>
+<div id="out" class="mut">Pick a tab or search a player.</div>
+
+<script>
+const COLS=[["ppg","PPG"],["rpg","RPG"],["apg","APG"],["threes_pg","3PM"],["stocks_pg","STL+BLK"]];
+const TABS={
+  leaders:"Leaders",season:"Season",opp:"vs Opponent",b2b:"Back-to-back",ha:"Home/Away"
+};
+let tab="leaders",stat="PTS";
+const $=id=>document.getElementById(id), out=$("out"), q=$("q");
+
+$("tabs").innerHTML=Object.entries(TABS).map(([k,v])=>`<button data-k="${k}">${v}</button>`).join("");
+$("tabs").onclick=e=>{if(e.target.dataset.k){tab=e.target.dataset.k;run()}};
+
+let t;q.oninput=()=>{clearTimeout(t);t=setTimeout(async()=>{
+  if(q.value.length<2)return;
+  const r=await(await fetch("/players?q="+encodeURIComponent(q.value))).json();
+  $("sugg").innerHTML=r.map(n=>`<option value="${n}">`).join("");
+},200)};
+q.onchange=()=>{if(tab==="leaders")tab="season";run()};
+
+function row(label,o){return `<tr><td>${label}</td><td>${o.games}</td>${COLS.map(([k])=>`<td>${o[k]??"-"}</td>`).join("")}</tr>`}
+function head(first){return `<tr><th>${first}</th><th>GP</th>${COLS.map(c=>`<th>${c[1]}</th>`).join("")}</tr>`}
+function diffRow(d){return `<tr><td>Diff</td><td></td>${COLS.map(([k])=>{const v=d[k];return `<td class="${v>0?"pos":v<0?"neg":""}">${v>0?"+":""}${v??"-"}</td>`}).join("")}</tr>`}
+const table=h=>`<div class="wrap"><table>${h}</table></div>`;
+
+async function run(){
+  document.querySelectorAll(".tabs button").forEach(b=>b.classList.toggle("on",b.dataset.k===tab));
+  out.className="mut";out.textContent="Loading…";
+  try{
+    let url,name=q.value.trim();
+    if(tab==="leaders") url=`/leaderboard?stat=${stat}&limit=25`;
+    else{
+      if(!name){out.textContent="Search a player first.";return}
+      url=`/player/${encodeURIComponent(name)}/`+{season:"season",opp:"vs-opponents",b2b:"back-to-back",ha:"home-away"}[tab];
+    }
+    const r=await fetch(url);
+    if(!r.ok)throw new Error((await r.json()).detail||r.status);
+    const d=await r.json();out.className="";
+    if(tab==="leaders"){
+      const s=[["PTS","PPG"],["REB","RPG"],["AST","APG"],["FG3M","3PM"],["STL_BLK","STL+BLK"]];
+      out.innerHTML=`<div class="tabs">${s.map(([k,l])=>`<button class="${k===stat?"on":""}" onclick="stat='${k}';run()">${l}</button>`).join("")}</div>`+
+        table(`<tr><th>Player</th><th>GP</th>${COLS.map(c=>`<th>${c[1]}</th>`).join("")}</tr>`+
+        d.leaders.map(p=>`<tr><td>${p.rank}. ${p.player} <span class="mut">${p.team}</span></td><td>${p.games}</td>${COLS.map(([k])=>`<td>${p[k]}</td>`).join("")}</tr>`).join(""));
+    }else if(tab==="season"){
+      out.innerHTML=`<h2>${d.player} · ${d.season}</h2>`+table(head("Season")+row("Avg",d));
+    }else if(tab==="opp"){
+      out.innerHTML=`<h2>${d.player} vs opponents</h2><p class="mut">Small samples early in the season.</p>`+
+        table(head("Opp")+row("All",d.season_avg)+d.by_opponent.map(o=>row(o.opponent,o)).join(""));
+    }else{
+      const [a,b,la,lb]=tab==="b2b"?[d.second_night_b2b,d.other_games,"B2B night 2","Other games"]:[d.home,d.away,"Home","Away"];
+      out.innerHTML=`<h2>${d.player}</h2>`+table(head("Split")+row(la,a)+row(lb,b)+diffRow(d.difference))+
+        `<p class="mut">Diff = ${la} minus ${lb}.</p>`;
+    }
+  }catch(e){out.className="neg";out.textContent="Error: "+e.message}
+}
+run();
+</script>
+</body>
+</html>
