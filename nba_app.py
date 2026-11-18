@@ -17,6 +17,7 @@ Examples:
 import time
 
 import os
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
@@ -104,14 +105,39 @@ def espn_get(url: str, **params) -> dict:
     return r.json()
 
 
+def _strip_accents(text: str) -> str:
+    return "".join(
+        c for c in unicodedata.normalize("NFKD", text) if not unicodedata.combining(c)
+    )
+
+
+def _find_nba_athletes(node, out):
+    """Walk any JSON shape and collect NBA athlete uids like s:40~l:46~a:3945274."""
+    if isinstance(node, dict):
+        uid = node.get("uid")
+        if isinstance(uid, str) and "~l:46~a:" in uid:
+            out.append(uid.split("~a:")[-1])
+        for v in node.values():
+            _find_nba_athletes(v, out)
+    elif isinstance(node, list):
+        for v in node:
+            _find_nba_athletes(v, out)
+
+
 def espn_athlete_id(name: str) -> str:
-    items = espn_get(ESPN_SEARCH, query=name, limit=10, mode="prefix").get("items", [])
-    found = [i for i in items if i.get("type") == "player"]
-    nba = [i for i in found if "~l:46~" in i.get("uid", "")]  # l:46 = NBA
-    pick = (nba or found or [None])[0]
-    if not pick:
-        raise HTTPException(404, f"ESPN has no player named '{name}'")
-    return str(pick["id"])
+    for query in (_strip_accents(name), name):
+        data = espn_get(ESPN_SEARCH, query=query, limit=10, mode="prefix")
+        ids: list = []
+        _find_nba_athletes(data, ids)
+        if ids:
+            return ids[0]
+    raise HTTPException(404, f"ESPN has no NBA player named '{name}'")
+
+
+@app.get("/debug/espn-search/{name}")
+def debug_espn_search(name: str):
+    """Troubleshooting: raw ESPN search response."""
+    return espn_get(ESPN_SEARCH, query=_strip_accents(name), limit=5, mode="prefix")
 
 
 def espn_games(name: str) -> pd.DataFrame:
